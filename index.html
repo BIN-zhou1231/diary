@@ -239,6 +239,13 @@ body {
   font-family: inherit; margin-top: 4px;
 }
 .api-input:focus { outline: none; border-color: var(--accent); }
+select.api-input {
+  appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238c7f6e'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+}
 
 /* ========== AI 按钮栏 ========== */
 .ai-bar {
@@ -422,7 +429,16 @@ body {
           <input type="time" class="time-input" id="reminderTime" value="21:00">
         </div>
         <div class="setting-row" style="flex-direction:column;align-items:stretch;">
-          <label style="margin-bottom:2px;">DeepSeek API Key</label>
+          <label style="margin-bottom:2px;">API 提供商</label>
+          <select class="api-input" id="providerSelect" style="cursor:pointer;">
+            <option value="deepseek">DeepSeek（推荐 / 最便宜）</option>
+            <option value="anthropic">Anthropic 官方</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="custom">自定义端点</option>
+          </select>
+        </div>
+        <div class="setting-row" style="flex-direction:column;align-items:stretch;">
+          <label style="margin-bottom:2px;">API Key</label>
           <input type="password" class="api-input" id="apiKeyInput"
                  value="" placeholder="sk-...">
         </div>
@@ -547,7 +563,8 @@ function loadSettings() {
     reminderEnabled: false,
     reminderHour: 21,
     reminderMinute: 0,
-    apiKey: ''
+    apiKey: '',
+    provider: 'deepseek'
   };
   try {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
@@ -571,6 +588,9 @@ function applySettings() {
   // 时间
   const timeStr = `${String(settings.reminderHour).padStart(2,'0')}:${String(settings.reminderMinute).padStart(2,'0')}`;
   document.getElementById('reminderTime').value = timeStr;
+
+  // Provider
+  document.getElementById('providerSelect').value = settings.provider;
 
   // API Key
   document.getElementById('apiKeyInput').value = settings.apiKey;
@@ -652,17 +672,43 @@ function checkReminder() {
   }
 }
 
-// ==================== AI 通信（直连 DeepSeek） ====================
+// ==================== AI 通信（多提供商支持） ====================
 
-const DEEPSEEK_API = 'https://api.deepseek.com/anthropic/v1/messages';
+/** 提供商配置 */
+const PROVIDERS = {
+  deepseek: {
+    name: 'DeepSeek',
+    endpoint: 'https://api.deepseek.com/anthropic/v1/messages',
+    model: 'deepseek-chat',
+    authHeader: 'x-api-key'
+  },
+  anthropic: {
+    name: 'Anthropic',
+    endpoint: 'https://api.anthropic.com/v1/messages',
+    model: 'claude-sonnet-4-6-20250514',
+    authHeader: 'x-api-key'
+  },
+  openrouter: {
+    name: 'OpenRouter',
+    endpoint: 'https://openrouter.ai/api/v1/messages',
+    model: 'anthropic/claude-sonnet-4',
+    authHeader: 'Authorization',
+    authPrefix: 'Bearer '
+  }
+};
+
+function getProviderConfig() {
+  return PROVIDERS[settings.provider] || PROVIDERS.deepseek;
+}
 
 function checkBackendHealth() {
   const statusEl = document.getElementById('aiStatus');
   const buttons = document.querySelectorAll('.ai-btn');
   const reportBtn = document.getElementById('reportBtn');
+  const provider = getProviderConfig();
 
   if (settings.apiKey) {
-    statusEl.textContent = '🟢 API 已就绪';
+    statusEl.textContent = `🟢 ${provider.name}`;
     buttons.forEach(b => b.disabled = false);
     reportBtn.disabled = false;
     return true;
@@ -675,26 +721,33 @@ function checkBackendHealth() {
 }
 
 async function callAI(systemPrompt, userMessage, maxTokens = 1024) {
+  const provider = getProviderConfig();
+
   const payload = JSON.stringify({
-    model: 'deepseek-chat',
+    model: provider.model,
     max_tokens: maxTokens,
     system: systemPrompt,
     messages: [{ role: 'user', content: userMessage }]
   });
 
-  const resp = await fetch(DEEPSEEK_API, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': settings.apiKey,
-      'anthropic-version': '2023-06-01'
-    },
-    body: payload
+  const headers = {
+    'Content-Type': 'application/json',
+    'anthropic-version': '2023-06-01'
+  };
+  // OpenRouter 用 Bearer token，其他用 x-api-key
+  if (provider.authPrefix) {
+    headers[provider.authHeader] = provider.authPrefix + settings.apiKey;
+  } else {
+    headers[provider.authHeader] = settings.apiKey;
+  }
+
+  const resp = await fetch(provider.endpoint, {
+    method: 'POST', headers, body: payload
   });
 
   if (!resp.ok) {
     const errText = await resp.text().catch(() => 'unknown');
-    throw new Error(`API error (${resp.status}): ${errText.slice(0, 200)}`);
+    throw new Error(`${provider.name} error (${resp.status}): ${errText.slice(0, 200)}`);
   }
 
   const data = await resp.json();
@@ -746,8 +799,8 @@ async function doAIAction(btn, systemPrompt, userMessage, title, maxTokens) {
   const online = await checkBackendHealth();
   if (!online) {
     showModal('⚠️ 需要 API Key',
-      '<p>请在左侧设置面板填入 <b>DeepSeek API Key</b> 即可使用 AI 功能。</p>'
-      + '<p>👉 <a href="https://platform.deepseek.com/api_keys" target="_blank">点击获取 DeepSeek API Key</a></p>');
+      '<p>请在左侧设置面板选择 API 提供商并填入 <b>API Key</b> 即可使用。</p>'
+      + '<p>👉 支持 DeepSeek / Anthropic / OpenRouter</p>');
     return;
   }
   setBtnLoading(btn, true);
@@ -832,7 +885,7 @@ async function doWeeklyReport() {
   const online = await checkBackendHealth();
   if (!online) {
     showModal('⚠️ 需要 API Key',
-      '<p>请在左侧设置面板填入 <b>DeepSeek API Key</b> 即可生成周报。</p>');
+      '<p>请在左侧设置面板填入 <b>API Key</b> 即可生成周报。</p>');
     return;
   }
 
@@ -1090,6 +1143,12 @@ document.getElementById('reminderTime').addEventListener('change', function() {
   const [h, m] = this.value.split(':').map(Number);
   settings.reminderHour = h;
   settings.reminderMinute = m;
+  saveSettings();
+});
+
+// Provider
+document.getElementById('providerSelect').addEventListener('change', function() {
+  settings.provider = this.value;
   saveSettings();
 });
 
