@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: diary-ai
+    runtime: python
+    plan: free
+    buildCommand: ""
+    startCommand: python diary-server.py
+    envVars:
+      - key: DEEPSEEK_KEY
+        sync: false
