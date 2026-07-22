@@ -422,9 +422,14 @@ body {
           <input type="time" class="time-input" id="reminderTime" value="21:00">
         </div>
         <div class="setting-row" style="flex-direction:column;align-items:stretch;">
-          <label style="margin-bottom:2px;">AI 后端地址</label>
+          <label style="margin-bottom:2px;">AI 后端地址（二选一）</label>
           <input type="text" class="api-input" id="apiEndpoint"
                  value="http://localhost:8787" placeholder="http://localhost:8787">
+        </div>
+        <div class="setting-row" style="flex-direction:column;align-items:stretch;">
+          <label style="margin-bottom:2px;">或直接填 API Key</label>
+          <input type="password" class="api-input" id="apiKeyInput"
+                 value="" placeholder="sk-...">
         </div>
       </div>
     </div>
@@ -547,7 +552,8 @@ function loadSettings() {
     reminderEnabled: false,
     reminderHour: 21,
     reminderMinute: 0,
-    apiEndpoint: 'http://localhost:8787'
+    apiEndpoint: 'http://localhost:8787',
+    apiKey: ''
   };
   try {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
@@ -574,6 +580,9 @@ function applySettings() {
 
   // API 端点
   document.getElementById('apiEndpoint').value = settings.apiEndpoint;
+
+  // API Key
+  document.getElementById('apiKeyInput').value = settings.apiKey;
 
   // 提醒定时器
   if (settings.reminderEnabled) startReminder();
@@ -654,18 +663,41 @@ function checkReminder() {
 
 // ==================== 后端通信 ====================
 
+const DEEPSEEK_API = 'https://api.deepseek.com/anthropic/v1/messages';
+
+/** 检查是否有可用的 AI 连接方式 */
+function hasAIConnection() {
+  return settings.apiKey || settings.apiEndpoint;
+}
+
 /** 检查后端是否可用 */
 async function checkBackendHealth() {
   const statusEl = document.getElementById('aiStatus');
   const buttons = document.querySelectorAll('.ai-btn');
   const reportBtn = document.getElementById('reportBtn');
 
+  // 优先用直连 API key
+  if (settings.apiKey) {
+    statusEl.textContent = '🟢 API 直连';
+    buttons.forEach(b => b.disabled = false);
+    reportBtn.disabled = false;
+    return true;
+  }
+
+  // 否则检查后端代理
+  if (!settings.apiEndpoint) {
+    statusEl.textContent = '⚪ 未配置 AI';
+    buttons.forEach(b => b.disabled = true);
+    reportBtn.disabled = true;
+    return false;
+  }
+
   try {
     const resp = await fetch(`${settings.apiEndpoint}/api/health`, {
       method: 'GET', signal: AbortSignal.timeout(3000)
     });
     if (resp.ok) {
-      statusEl.textContent = '🟢 AI 已连接';
+      statusEl.textContent = '🟢 后端已连接';
       buttons.forEach(b => b.disabled = false);
       reportBtn.disabled = false;
       return true;
@@ -678,8 +710,64 @@ async function checkBackendHealth() {
   return false;
 }
 
-/** 调 AI chat 接口 */
+/** 直连 DeepSeek API */
+async function callDeepSeekDirect(systemPrompt, userMessage, maxTokens) {
+  const payload = JSON.stringify({
+    model: 'deepseek-chat',
+    max_tokens: maxTokens,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userMessage }]
+  });
+
+  const resp = await fetch(DEEPSEEK_API, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': settings.apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    body: payload
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => 'unknown');
+    throw new Error(`API 错误 (${resp.status}): ${errText.slice(0, 200)}`);
+  }
+
+  const data = await resp.json();
+  // Anthropic 格式: {content: [{type: "text", text: "..."}]}
+  if (Array.isArray(data.content)) {
+    return data.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('');
+  }
+  return String(data.content || '');
+}
+
+/** 直连生成周报 */
+async function callWeeklyReportDirect(entries) {
+  const diaryText = entries.map(e =>
+    `【${e.date}】${e.title}\n心情: ${e.mood}  天气: ${e.weather}\n${e.content}`
+  ).join('\n\n---\n\n');
+
+  const systemPrompt = (
+    '你是一位温暖的心理分析师和写作教练。根据用户一周的日记，生成一份简洁的情绪周报。'
+    + '包含：1) 本周情绪趋势（一句话概括）2) 亮点时刻 3) 一个温柔的建议。'
+    + '用温暖、鼓励的语气，控制在 300 字以内。'
+  );
+
+  return callDeepSeekDirect(systemPrompt, diaryText, 800);
+}
+
+/** 调 AI（自动选直连或后端） */
 async function callAI(systemPrompt, userMessage, maxTokens = 1024) {
+  // 优先直连
+  if (settings.apiKey) {
+    return callDeepSeekDirect(systemPrompt, userMessage, maxTokens);
+  }
+
+  // 后端代理
   const resp = await fetch(`${settings.apiEndpoint}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -697,8 +785,12 @@ async function callAI(systemPrompt, userMessage, maxTokens = 1024) {
   return data.content;
 }
 
-/** 调周报接口 */
+/** 调周报（自动选直连或后端） */
 async function callWeeklyReport(entries) {
+  if (settings.apiKey) {
+    return callWeeklyReportDirect(entries);
+  }
+
   const resp = await fetch(`${settings.apiEndpoint}/api/weekly-report`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -741,7 +833,10 @@ function setBtnLoading(btn, loading) {
 async function doAIAction(btn, systemPrompt, userMessage, title, maxTokens) {
   const online = await checkBackendHealth();
   if (!online) {
-    showModal('⚠️ 连接失败', '<p>AI 后端未启动，请运行 <code>python diary-server.py</code> 后刷新页面。</p>');
+    showModal('⚠️ 连接失败',
+      '<p>请先配置 AI 连接方式：</p>'
+      + '<p>👉 在左侧设置面板填入 <b>API Key</b>（直连 DeepSeek，推荐）</p>'
+      + '<p>👉 或启动 <code>python diary-server.py</code> 后端代理</p>');
     return;
   }
   setBtnLoading(btn, true);
@@ -825,7 +920,8 @@ async function doAnalyze() {
 async function doWeeklyReport() {
   const online = await checkBackendHealth();
   if (!online) {
-    showModal('⚠️ 连接失败', '<p>AI 后端未启动，请运行 <code>python diary-server.py</code> 后刷新页面。</p>');
+    showModal('⚠️ 连接失败',
+      '<p>请先配置 AI 连接方式：在左侧设置面板填入 <b>API Key</b> 或启动后端代理。</p>');
     return;
   }
 
@@ -1089,6 +1185,12 @@ document.getElementById('reminderTime').addEventListener('change', function() {
 // API 端点
 document.getElementById('apiEndpoint').addEventListener('change', function() {
   settings.apiEndpoint = this.value.replace(/\/$/, '');
+  saveSettings();
+});
+
+// API Key（直连模式）
+document.getElementById('apiKeyInput').addEventListener('change', function() {
+  settings.apiKey = this.value.trim();
   saveSettings();
 });
 
